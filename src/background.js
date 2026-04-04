@@ -8,7 +8,6 @@ chrome.runtime.onInstalled.addListener(async () => {
     chrome.idle.setDetectionInterval(60);
 
     // 2. Create our recurring alarms
-    // Sync settings every 6 hours, but batch upload data every 1 hour
     chrome.alarms.create("syncInsightConfig", { periodInMinutes: 360 });
     chrome.alarms.create("ingestInsightLogs", { periodInMinutes: 60 });
     
@@ -35,20 +34,49 @@ chrome.runtime.onInstalled.addListener(async () => {
 });
 
 // ==========================================
-// ⏱️ THE STOPWATCH STATE MACHINE
+// ⏱️ THE STOPWATCH & HIT TRACKER
 // ==========================================
 
-// Helper: Safely extract domain from URL (removes www.)
+// Helper 1: Extract domain for ROI Time Tracking
 function extractDomain(urlStr) {
     try {
         const urlObj = new URL(urlStr);
+        if (!urlObj.protocol.startsWith('http')) return null;
         return urlObj.hostname.replace(/^www\./, '');
     } catch (e) {
-        return null; // Invalid URL or internal chrome:// page
+        return null;
     }
 }
 
-// Core logic: Closes the previous timer and starts a new one
+// Helper 2: URL Normalizer for Audit Hit Tracking (Strips Query Params)
+function normalizeUrl(urlStr) {
+    try {
+        const urlObj = new URL(urlStr);
+        if (!urlObj.protocol.startsWith('http')) return null;
+        
+        const domain = urlObj.hostname.replace(/^www\./, '');
+        let path = urlObj.pathname;
+        if (path === '/') path = ''; // Clean up root paths
+        
+        return domain + path;
+    } catch (e) {
+        return null;
+    }
+}
+
+// Records an exact URL visit (Bypasses 5-minute rule)
+async function recordUrlHit(urlStr) {
+    const normalized = normalizeUrl(urlStr);
+    if (!normalized) return;
+
+    const data = await chrome.storage.local.get(['hitLogs']);
+    let hitLogs = data.hitLogs || {};
+
+    hitLogs[normalized] = (hitLogs[normalized] || 0) + 1;
+    await chrome.storage.local.set({ hitLogs });
+}
+
+// Closes previous timer and starts a new one
 async function updateActiveSession(newUrl, isIdleOrInactive) {
     const data = await chrome.storage.local.get(['activeSession', 'timeLogs']);
     let timeLogs = data.timeLogs || {};
@@ -61,7 +89,6 @@ async function updateActiveSession(newUrl, isIdleOrInactive) {
         const elapsedMs = now - activeSession.startTime;
         const elapsedMins = elapsedMs / (1000 * 60);
 
-        // Sanity Check: Cap at 4 hours just in case the computer fell asleep weirdly
         if (elapsedMins > 0 && elapsedMins < 240) {
             timeLogs[activeSession.domain] = (timeLogs[activeSession.domain] || 0) + elapsedMins;
         }
@@ -69,7 +96,7 @@ async function updateActiveSession(newUrl, isIdleOrInactive) {
 
     // 2. Start the new session
     if (isIdleOrInactive || !newUrl || newUrl.startsWith('chrome://')) {
-        activeSession = null; // Pause the stopwatch entirely
+        activeSession = null; 
     } else {
         const domain = extractDomain(newUrl);
         if (domain) {
@@ -79,7 +106,6 @@ async function updateActiveSession(newUrl, isIdleOrInactive) {
         }
     }
 
-    // 3. Save the updated stopwatch state back to Chrome storage
     await chrome.storage.local.set({ activeSession, timeLogs });
 }
 
@@ -87,26 +113,28 @@ async function updateActiveSession(newUrl, isIdleOrInactive) {
 // 🎧 BROWSER EVENT LISTENERS
 // ==========================================
 
-// Trigger 1: User switches tabs
 chrome.tabs.onActivated.addListener(async (activeInfo) => {
     const tab = await chrome.tabs.get(activeInfo.tabId);
     await updateActiveSession(tab.url, false);
 });
 
-// Trigger 2: User navigates to a new URL in the current tab
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-    if (changeInfo.url && tab.active) {
-        await updateActiveSession(changeInfo.url, false);
+    // Only fire when the URL actually changes (a true navigation/hit)
+    if (changeInfo.url) {
+        // Record the exact URL hit for the Audit logs
+        await recordUrlHit(changeInfo.url);
+        
+        // Update time tracking if this is the active tab
+        if (tab.active) {
+            await updateActiveSession(changeInfo.url, false);
+        }
     }
 });
 
-// Trigger 3: User minimizes Chrome or switches to another desktop app
 chrome.windows.onFocusChanged.addListener(async (windowId) => {
     if (windowId === chrome.windows.WINDOW_ID_NONE) {
-        // Chrome lost focus completely. Pause the stopwatch!
         await updateActiveSession(null, true);
     } else {
-        // Chrome regained focus. Find the active tab and resume!
         const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
         if (tabs.length > 0) {
             await updateActiveSession(tabs[0].url, false);
@@ -114,13 +142,10 @@ chrome.windows.onFocusChanged.addListener(async (windowId) => {
     }
 });
 
-// Trigger 4: User walks away from the keyboard (Idle Detection)
 chrome.idle.onStateChanged.addListener(async (newState) => {
     if (newState === 'idle' || newState === 'locked') {
-        console.log("User went idle. Pausing stopwatch.");
         await updateActiveSession(null, true);
     } else if (newState === 'active') {
-        console.log("User returned. Resuming stopwatch.");
         const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
         if (tabs.length > 0) {
             await updateActiveSession(tabs[0].url, false);
@@ -144,7 +169,6 @@ async function syncConfig() {
         
         const data = await response.json();
         
-        // Save the approved apps and thresholds locally
         await chrome.storage.local.set({
             approvedApps: data.approvedApps,
             systemConfig: data.config
@@ -157,35 +181,36 @@ async function syncConfig() {
 }
 
 async function uploadLogs() {
-    console.log("📤 Preparing to batch upload time logs...");
+    console.log("📤 Preparing to batch upload time & hit logs...");
     try {
-        // 1. Force the stopwatch to close out the current session so the data is fresh
+        // Force the stopwatch to close out the current session
         const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
         if (tabs.length > 0) {
             await updateActiveSession(tabs[0].url, false);
         }
 
-        const data = await chrome.storage.local.get(['studentHash', 'timeLogs', 'approvedApps', 'systemConfig']);
+        const data = await chrome.storage.local.get(['studentHash', 'timeLogs', 'hitLogs', 'approvedApps', 'systemConfig']);
         
         const timeLogs = data.timeLogs || {};
+        const hitLogs = data.hitLogs || {};
         const approvedSet = new Set(data.approvedApps || []);
-        // Default to 5 mins if the config is missing
         const threshold = parseFloat(data.systemConfig?.insight_unapproved_threshold_minutes || "5");
 
-        const logsToUpload = [];
+        const masterLogs = [];
 
-        // 2. Filter the logs based on the School's Settings!
+        // 1. Process Time Logs (Filtered by 5-minute rule)
         for (const [domain, minutes] of Object.entries(timeLogs)) {
-            if (approvedSet.has(domain)) {
-                // ALWAYS upload approved app data (for ROI calculation)
-                logsToUpload.push({ target: domain, minutes: minutes });
-            } else if (minutes >= threshold) {
-                // ONLY upload shadow IT data if they spent more than the threshold on it
-                logsToUpload.push({ target: domain, minutes: minutes });
+            if (approvedSet.has(domain) || minutes >= threshold) {
+                masterLogs.push({ type: "time", target: domain, value: minutes });
             }
         }
 
-        if (logsToUpload.length === 0) {
+        // 2. Process Hit Logs (Exact URLs, NO time threshold!)
+        for (const [url, hits] of Object.entries(hitLogs)) {
+            masterLogs.push({ type: "hit", target: url, value: hits });
+        }
+
+        if (masterLogs.length === 0) {
             console.log("No significant logs to upload this hour.");
             return;
         }
@@ -194,22 +219,33 @@ async function uploadLogs() {
         const localConfig = await (await fetch(configUrl)).json();
         const baseUrl = localConfig.workerUrl.endsWith('/') ? localConfig.workerUrl.slice(0, -1) : localConfig.workerUrl;
 
-        // 3. Send the batched array to the server
-        const response = await fetch(`${baseUrl}/api/insight/ingest`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                studentHash: data.studentHash,
-                logs: logsToUpload
-            })
-        });
+        // 3. CHUNKING LOGIC: Stay under Cloudflare's 250 writeDataPoint limit
+        const MAX_PAYLOAD_SIZE = 200; 
+        let allChunksSuccessful = true;
 
-        if (response.ok) {
-            // 4. CRITICAL: Wipe the local timeLogs so we don't upload duplicates next hour!
-            await chrome.storage.local.set({ timeLogs: {} });
-            console.log(`✅ Uploaded ${logsToUpload.length} app logs successfully!`);
-        } else {
-            console.error("❌ Upload failed. Will try again next hour.");
+        for (let i = 0; i < masterLogs.length; i += MAX_PAYLOAD_SIZE) {
+            const chunk = masterLogs.slice(i, i + MAX_PAYLOAD_SIZE);
+
+            const response = await fetch(`${baseUrl}/api/insight/ingest`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    studentHash: data.studentHash,
+                    logs: chunk
+                })
+            });
+
+            if (!response.ok) {
+                console.error(`❌ Chunk ${i / MAX_PAYLOAD_SIZE + 1} failed.`);
+                allChunksSuccessful = false;
+                break; // Stop uploading, keep remaining data for next hour
+            }
+        }
+
+        if (allChunksSuccessful) {
+            // CRITICAL: Only wipe local logs if EVERY chunk uploaded successfully
+            await chrome.storage.local.set({ timeLogs: {}, hitLogs: {} });
+            console.log(`✅ Uploaded ${masterLogs.length} total data points across chunks!`);
         }
 
     } catch (err) {
@@ -217,7 +253,6 @@ async function uploadLogs() {
     }
 }
 
-// Route our Alarms
 chrome.alarms.onAlarm.addListener((alarm) => {
     if (alarm.name === "syncInsightConfig") {
         syncConfig();
