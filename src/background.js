@@ -56,16 +56,23 @@ function extractDomain(urlStr) {
     }
 }
 
-// Helper 2: URL Normalizer for Audit Hit Tracking (Strips Query Params)
+// Helper 2: URL Normalizer for Audit Hit Tracking (Smarter SPA Tracking)
 function normalizeUrl(urlStr) {
     try {
-        const cleanUrl = urlStr.split('#')[0];
-        const urlObj = new URL(cleanUrl);
+        const urlObj = new URL(urlStr);
         if (!urlObj.protocol.startsWith('http')) return null;
         
         const domain = urlObj.hostname.replace(/^www\./, '');
         let path = urlObj.pathname;
-        if (path === '/') path = ''; // Clean up root paths
+        
+        // 🎯 FIX: Preserve SPA routes that use hashes (e.g. #/dashboard) 
+        // while still stripping standard anchor tags (e.g. #section1)
+        if (urlObj.hash.startsWith('#/')) {
+            path += urlObj.hash;
+        }
+        
+        // Clean up root paths ONLY if there is no hash path appended
+        if (path === '/') path = ''; 
         
         return domain + path;
     } catch (e) {
@@ -165,21 +172,36 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     }
 });
 
+// 🎯 FIX: Comprehensive SPA and Hash Navigation Tracking
 if (chrome.webNavigation) {
-    chrome.webNavigation.onHistoryStateUpdated.addListener(async (details) => {
-        if (details.frameId === 0) { 
+    const handleSpaNavigation = async (details) => {
+        if (details.frameId === 0) { // Only track the main frame, ignore iframes
             debugLog(`🔄 SPA Navigation detected: ${details.url}`);
+            
             if (details.url !== tabUrlCache[details.tabId]) {
                 tabUrlCache[details.tabId] = details.url;
                 await recordUrlHit(details.url);
 
-                const tab = await chrome.tabs.get(details.tabId);
-                if (tab.active) {
-                    await updateActiveSession(details.url, false);
+                try {
+                    const tab = await chrome.tabs.get(details.tabId);
+                    if (tab && tab.active) {
+                        await updateActiveSession(details.url, false);
+                    }
+                } catch (err) {
+                    debugLog("Could not fetch tab during SPA navigation", err);
                 }
             }
         }
-    });
+    };
+
+    // React/Angular router (History API pushes)
+    chrome.webNavigation.onHistoryStateUpdated.addListener(handleSpaNavigation);
+    
+    // Hash-based routers (site.com/#/path)
+    chrome.webNavigation.onReferenceFragmentUpdated.addListener(handleSpaNavigation);
+    
+} else {
+    console.warn("⚠️ webNavigation API not found. Please add 'webNavigation' to manifest.json permissions!");
 }
 
 chrome.tabs.onReplaced.addListener(async (addedTabId, removedTabId) => {
@@ -333,7 +355,6 @@ async function uploadLogs() {
         }
 
         // 🎯 3. Safe Subtraction (Fixes Race Conditions & Threshold Resets)
-        // We fetch the storage AGAIN, because new logs might have been created while we were uploading!
         const currentData = await chrome.storage.local.get(['timeLogs', 'hitLogs']);
         let currentTime = currentData.timeLogs || {};
         let currentHits = currentData.hitLogs || {};
@@ -344,7 +365,7 @@ async function uploadLogs() {
         for (const [domain, minutes] of Object.entries(successfullyUploadedTime)) {
             if (currentTime[domain]) {
                 currentTime[domain] -= minutes;
-                if (currentTime[domain] <= 0.01) { // 0.01 handles floating point math bugs
+                if (currentTime[domain] <= 0.01) { 
                     delete currentTime[domain];
                 }
                 removedCount++;
@@ -377,3 +398,14 @@ chrome.alarms.onAlarm.addListener((alarm) => {
         uploadLogs();
     }
 });
+// ==========================================
+// 🧪 TESTING EXPORTS
+// ==========================================
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {
+        extractDomain,
+        normalizeUrl,
+        updateActiveSession,
+        recordUrlHit
+    };
+}
