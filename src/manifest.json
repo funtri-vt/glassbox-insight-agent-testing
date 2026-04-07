@@ -5,6 +5,7 @@
   "description": "Privacy-first background analytics and time-tracking for educational environments.",
   "permissions": [
     "storage",
+    "unlimitedStorage",
     "identity",
     "alarms",
     "tabs",
