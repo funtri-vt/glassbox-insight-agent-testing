@@ -398,3 +398,14 @@ chrome.alarms.onAlarm.addListener((alarm) => {
         uploadLogs();
     }
 });
+// ==========================================
+// 🧪 TESTING EXPORTS
+// ==========================================
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = {
+        extractDomain,
+        normalizeUrl,
+        updateActiveSession,
+        recordUrlHit
+    };
+}

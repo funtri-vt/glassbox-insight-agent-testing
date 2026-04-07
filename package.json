@@ -1,0 +1,13 @@
+{
+  "name": "glassbox-insight-agent",
+  "version": "1.0.0",
+  "description": "Enterprise Chrome Telemetry Agent",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "devDependencies": {
+    "jsdom": "24.0.0",
+    "vitest": "1.5.0"
+  }
+}

@@ -1,0 +1,29 @@
+name: Glassbox Extension Tests
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20'
+        cache: 'npm' # Speeds up subsequent runs by caching dependencies
+
+    - name: Install dependencies
+      # Using npm ci (clean install) is best practice for CI environments 
+      # as it strictly follows the package-lock.json versions
+      run: npm ci
+
+    - name: Run Vitest test suite
+      run: npm test
