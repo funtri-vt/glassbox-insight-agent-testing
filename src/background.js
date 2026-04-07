@@ -64,13 +64,15 @@ function normalizeUrl(urlStr) {
         
         const domain = urlObj.hostname.replace(/^www\./, '');
         let path = urlObj.pathname;
-        if (path === '/') path = ''; // Clean up root paths
         
         // 🎯 FIX: Preserve SPA routes that use hashes (e.g. #/dashboard) 
         // while still stripping standard anchor tags (e.g. #section1)
         if (urlObj.hash.startsWith('#/')) {
             path += urlObj.hash;
         }
+        
+        // Clean up root paths ONLY if there is no hash path appended
+        if (path === '/') path = ''; 
         
         return domain + path;
     } catch (e) {
