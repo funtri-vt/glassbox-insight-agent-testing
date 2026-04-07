@@ -47,7 +47,6 @@ chrome.runtime.onStartup.addListener(async () => {
 // Helper 1: Extract domain for ROI Time Tracking
 function extractDomain(urlStr) {
     try {
-        // 🎯 FIX 1: Strip hash fragments (e.g., #section1) to prevent fake SPA navigations
         const cleanUrl = urlStr.split('#')[0];
         const urlObj = new URL(cleanUrl);
         if (!urlObj.protocol.startsWith('http')) return null;
@@ -60,7 +59,6 @@ function extractDomain(urlStr) {
 // Helper 2: URL Normalizer for Audit Hit Tracking (Strips Query Params)
 function normalizeUrl(urlStr) {
     try {
-        // 🎯 FIX 1: Strip hash fragments here as well
         const cleanUrl = urlStr.split('#')[0];
         const urlObj = new URL(cleanUrl);
         if (!urlObj.protocol.startsWith('http')) return null;
@@ -167,11 +165,9 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     }
 });
 
-// 🎯 FIX 2: Single Page Applications (SPAs)
-// Intercepts History API changes (React/Angular) that don't trigger full page reloads
 if (chrome.webNavigation) {
     chrome.webNavigation.onHistoryStateUpdated.addListener(async (details) => {
-        if (details.frameId === 0) { // Only track the main frame, ignore iframes
+        if (details.frameId === 0) { 
             debugLog(`🔄 SPA Navigation detected: ${details.url}`);
             if (details.url !== tabUrlCache[details.tabId]) {
                 tabUrlCache[details.tabId] = details.url;
@@ -186,8 +182,6 @@ if (chrome.webNavigation) {
     });
 }
 
-// 🎯 FIX 3: The Tab Replacement Quirk
-// Prevents losing the timer when Chrome silently swaps a background tab into the foreground
 chrome.tabs.onReplaced.addListener(async (addedTabId, removedTabId) => {
     debugLog(`🔄 Tab ${removedTabId} was replaced by ${addedTabId}`);
     
@@ -196,7 +190,6 @@ chrome.tabs.onReplaced.addListener(async (addedTabId, removedTabId) => {
         delete tabUrlCache[removedTabId];
     }
     
-    // Check if the replaced tab is the one they are actively looking at
     const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
     if (tabs.length > 0 && tabs[0].id === addedTabId) {
         await updateActiveSession(tabs[0].url, false);
@@ -259,6 +252,13 @@ async function syncConfig() {
 
 async function uploadLogs() {
     console.log("📤 Preparing to batch upload time & hit logs...");
+    
+    // 🎯 1. Instant Offline Queueing Check
+    if (!navigator.onLine) {
+        console.log("📶 Device is offline. Telemetry securely queued in local storage for next hour.");
+        return;
+    }
+
     try {
         // Force the stopwatch to close out the current session
         const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -282,13 +282,13 @@ async function uploadLogs() {
             }
         }
 
-        // 2. Process Hit Logs (Exact URLs, NO time threshold!)
+        // 2. Process Hit Logs (Exact URLs, NO time threshold)
         for (const [url, hits] of Object.entries(hitLogs)) {
             masterLogs.push({ type: "hit", target: url, value: hits });
         }
 
         if (masterLogs.length === 0) {
-            console.log("No significant logs to upload this hour.");
+            console.log("No significant logs to upload this hour. Queue rolling over.");
             return;
         }
 
@@ -296,34 +296,74 @@ async function uploadLogs() {
         const localConfig = await (await fetch(configUrl)).json();
         const baseUrl = localConfig.workerUrl.endsWith('/') ? localConfig.workerUrl.slice(0, -1) : localConfig.workerUrl;
 
-        // 3. CHUNKING LOGIC: Stay under Cloudflare's 250 writeDataPoint limit
         const MAX_PAYLOAD_SIZE = 200; 
-        let allChunksSuccessful = true;
+        
+        // 🎯 2. Track EXACTLY what we upload successfully
+        const successfullyUploadedTime = {};
+        const successfullyUploadedHits = {};
 
         for (let i = 0; i < masterLogs.length; i += MAX_PAYLOAD_SIZE) {
             const chunk = masterLogs.slice(i, i + MAX_PAYLOAD_SIZE);
 
-            const response = await fetch(`${baseUrl}/api/insight/ingest`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    studentHash: data.studentHash,
-                    logs: chunk
-                })
-            });
+            try {
+                const response = await fetch(`${baseUrl}/api/insight/ingest`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        studentHash: data.studentHash,
+                        logs: chunk
+                    })
+                });
 
-            if (!response.ok) {
-                console.error(`❌ Chunk ${i / MAX_PAYLOAD_SIZE + 1} failed.`);
-                allChunksSuccessful = false;
-                break; // Stop uploading, keep remaining data for next hour
+                if (!response.ok) {
+                    console.error(`❌ Chunk ${i / MAX_PAYLOAD_SIZE + 1} failed. Stopping upload to queue remaining data.`);
+                    break; 
+                }
+
+                // If chunk succeeded, record it for safe deletion later
+                chunk.forEach(log => {
+                    if (log.type === 'time') successfullyUploadedTime[log.target] = log.value;
+                    if (log.type === 'hit') successfullyUploadedHits[log.target] = log.value;
+                });
+
+            } catch (fetchErr) {
+                console.error("📶 Network error mid-upload. Queueing remaining data.", fetchErr);
+                break; // Break the loop so we don't try to send more chunks while offline
             }
         }
 
-        if (allChunksSuccessful) {
-            // CRITICAL: Only wipe local logs if EVERY chunk uploaded successfully
-            await chrome.storage.local.set({ timeLogs: {}, hitLogs: {} });
-            console.log(`✅ Uploaded ${masterLogs.length} total data points across chunks!`);
+        // 🎯 3. Safe Subtraction (Fixes Race Conditions & Threshold Resets)
+        // We fetch the storage AGAIN, because new logs might have been created while we were uploading!
+        const currentData = await chrome.storage.local.get(['timeLogs', 'hitLogs']);
+        let currentTime = currentData.timeLogs || {};
+        let currentHits = currentData.hitLogs || {};
+
+        let removedCount = 0;
+
+        // Subtract only what was safely delivered to Cloudflare
+        for (const [domain, minutes] of Object.entries(successfullyUploadedTime)) {
+            if (currentTime[domain]) {
+                currentTime[domain] -= minutes;
+                if (currentTime[domain] <= 0.01) { // 0.01 handles floating point math bugs
+                    delete currentTime[domain];
+                }
+                removedCount++;
+            }
         }
+        
+        for (const [url, hits] of Object.entries(successfullyUploadedHits)) {
+            if (currentHits[url]) {
+                currentHits[url] -= hits;
+                if (currentHits[url] <= 0) {
+                    delete currentHits[url];
+                }
+                removedCount++;
+            }
+        }
+
+        // Save the reconciled state back to storage
+        await chrome.storage.local.set({ timeLogs: currentTime, hitLogs: currentHits });
+        console.log(`✅ Upload cycle complete. Safely subtracted ${removedCount} synced items from local queue.`);
 
     } catch (err) {
         console.error("❌ Batch Upload Error:", err);
