@@ -1,5 +1,4 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-// We assume you add a small export block at the bottom of background.js for testing
 import { normalizeUrl, extractDomain, updateActiveSession } from '../src/background.js';
 
 describe('URL Normalizer Edge Cases (normalizeUrl)', () => {
@@ -38,17 +37,11 @@ describe('The Stopwatch Logic (updateActiveSession)', () => {
         // Reset our fake Chrome Storage before every test
         mockStorage = { timeLogs: {}, activeSession: null };
         
-        // Mock the Chrome API global
-        global.chrome = {
-            storage: {
-                local: {
-                    get: vi.fn().mockImplementation(async (keys) => mockStorage),
-                    set: vi.fn().mockImplementation(async (data) => {
-                        mockStorage = { ...mockStorage, ...data };
-                    })
-                }
-            }
-        };
+        // Attach our custom logic to the global mock defined in setup.js
+        global.chrome.storage.local.get.mockImplementation(async () => mockStorage);
+        global.chrome.storage.local.set.mockImplementation(async (data) => {
+            mockStorage = { ...mockStorage, ...data };
+        });
         
         // Mock Date.now() to control time
         vi.useFakeTimers();

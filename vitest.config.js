@@ -4,7 +4,7 @@ export default defineConfig({
   test: {
     environment: 'jsdom',
     globals: true,
-    // Clear mocks between tests to ensure a clean slate
     clearMocks: true,
+    setupFiles: ['./tests/setup.js'], // Tells Vitest to run this BEFORE any imports
   },
 });
