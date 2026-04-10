@@ -1,4 +1,31 @@
 // ==========================================
+// 🤝 THE STARTUP HANDSHAKE
+// ==========================================
+async function performHandshake(studentHash) {
+    try {
+        const configUrl = chrome.runtime.getURL("config.json");
+        const config = await (await fetch(configUrl)).json();
+        const baseUrl = config.workerUrl.endsWith('/') ? config.workerUrl.slice(0, -1) : config.workerUrl;
+
+        const res = await fetch(`${baseUrl}/api/student/me?hash=${studentHash}`);
+        
+        if (res.status === 404) {
+            console.log("⚠️ Student not registered. Opening setup page...");
+            chrome.tabs.create({ url: chrome.runtime.getURL("setup.html") });
+            return false;
+        } else if (res.ok) {
+            const data = await res.json();
+            await chrome.storage.local.set({ schoolId: data.schoolId });
+            console.log(`✅ Student securely locked to school ID: ${data.schoolId}`);
+            return true;
+        }
+    } catch (err) {
+        console.error("Handshake failed (offline?).", err);
+        return false;
+    }
+}
+
+// ==========================================
 // 🚀 INITIALIZATION & SETUP
 // ==========================================
 chrome.runtime.onInstalled.addListener(async () => {
@@ -25,19 +52,29 @@ chrome.runtime.onInstalled.addListener(async () => {
         await chrome.storage.local.set({ studentHash: studentHash });
         console.log("✅ Student ID securely hashed:", studentHash);
         
-        // 4. Trigger an immediate sync right after installation
-        await syncConfig();
+        // 4. Perform Handshake & Sync
+        const isRegistered = await performHandshake(studentHash);
+        if (isRegistered) {
+            await syncConfig();
+        }
         
     } catch (error) {
         console.error("❌ Failed to hash identity:", error);
     }
 });
 
-// 🎯 FIX 4: The Ghost Session Cleanup
-// Clears out dangling active sessions if Chrome crashed or the battery died
+// 🎯 FIX: The Ghost Session Cleanup & Startup Handshake
 chrome.runtime.onStartup.addListener(async () => {
-    console.log("🧹 Chrome started. Cleaning up ghost sessions...");
+    console.log("🧹 Chrome started. Cleaning up ghost sessions & verifying identity...");
     await chrome.storage.local.set({ activeSession: null });
+    
+    const data = await chrome.storage.local.get('studentHash');
+    if (data.studentHash) {
+        const isRegistered = await performHandshake(data.studentHash);
+        if (isRegistered) {
+            await syncConfig();
+        }
+    }
 });
 
 // ==========================================
@@ -251,19 +288,25 @@ chrome.idle.onStateChanged.addListener(async (newState) => {
 
 async function syncConfig() {
     console.log("🔄 Fetching Insight Settings from Cloudflare...");
+    
+    // 🎯 FIX: Retrieve the locked schoolId from local storage
+    const data = await chrome.storage.local.get('schoolId');
+    const schoolId = data.schoolId || 1;
+    
     try {
         const configUrl = chrome.runtime.getURL("config.json");
         const localConfig = await (await fetch(configUrl)).json();
         const baseUrl = localConfig.workerUrl.endsWith('/') ? localConfig.workerUrl.slice(0, -1) : localConfig.workerUrl;
 
-        const response = await fetch(`${baseUrl}/api/insight/sync`);
+        // 🎯 FIX: Append schoolId to the query
+        const response = await fetch(`${baseUrl}/api/insight/sync?schoolId=${schoolId}`);
         if (!response.ok) throw new Error("Sync failed");
         
-        const data = await response.json();
+        const resData = await response.json();
         
         await chrome.storage.local.set({
-            approvedApps: data.approvedApps,
-            systemConfig: data.config
+            approvedApps: resData.approvedApps,
+            systemConfig: resData.config
         });
         
         console.log("✅ Config Synced!");
@@ -398,6 +441,7 @@ chrome.alarms.onAlarm.addListener((alarm) => {
         uploadLogs();
     }
 });
+
 // ==========================================
 // 🧪 TESTING EXPORTS
 // ==========================================
