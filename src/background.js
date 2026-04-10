@@ -78,6 +78,19 @@ chrome.runtime.onStartup.addListener(async () => {
 });
 
 // ==========================================
+// 📨 MESSAGE LISTENERS (NEW)
+// ==========================================
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+    if (request.action === "force_sync") {
+        console.log("📥 Received force_sync command from setup page. Executing immediate sync...");
+        syncConfig().then(() => {
+            sendResponse({ success: true });
+        });
+        return true; // Keep the message channel open for the async response
+    }
+});
+
+// ==========================================
 // ⏱️ THE STOPWATCH & HIT TRACKER
 // ==========================================
 
